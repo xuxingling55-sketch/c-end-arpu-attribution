@@ -13,6 +13,7 @@
 ```text
 .
 ├── .cursor/skills/c-end-arpu-attribution/SKILL.md
+├── config.example.json
 ├── scripts/run_arpu_attribution.py
 ├── examples/4月C端ARPU环比下滑归因分析.md
 ├── outputs/.gitkeep
@@ -22,22 +23,15 @@
 
 ## 快速使用
 
-先确保 `c-query-cli-lite` 可以正常取数：
-
-```bash
-cd /Users/hilda/Documents/GitHub/c-query-cli-lite
-python3 -m pip install -r requirements.txt
-cp config.example.json config.json
-```
-
-打开 `c-query-cli-lite/config.json`，按该项目要求填入 StarRocks / SparkSQL 账号密码。
-
-再回到本项目安装轻量依赖：
+本项目是独立项目，内置 StarRocks / SparkSQL 数据库执行器，并使用本项目自己的配置文件。
 
 ```bash
 cd /Users/hilda/Documents/GitHub/c-end-arpu-attribution
 python3 -m pip install -r requirements.txt
+cp config.example.json config.json
 ```
+
+打开本项目的 `config.json`，填入 StarRocks / SparkSQL 账号密码。
 
 运行 2026 年 4 月对比 3 月的归因取数：
 
@@ -48,16 +42,15 @@ python3 scripts/run_arpu_attribution.py \
   --output-dir outputs/c_end_arpu_202604_vs_202603
 ```
 
-脚本默认读取同级目录下的 `../c-query-cli-lite/config.json`，并复用 `c-query-cli-lite/src/executor.py` 的 StarRocks 优先、失败后切 SparkSQL 的执行方式。
+脚本默认读取当前目录的 `config.json`，按 StarRocks 优先、失败后切 SparkSQL 的方式执行。
 
-如果 `c-query-cli-lite` 不在默认路径，可显式指定：
+如果配置文件不在默认路径，可显式指定：
 
 ```bash
 python3 scripts/run_arpu_attribution.py \
   --analysis-month 202604 \
   --compare-month 202603 \
-  --query-cli-root /path/to/c-query-cli-lite \
-  --config /path/to/c-query-cli-lite/config.json
+  --config /path/to/config.json
 ```
 
 脚本会输出：

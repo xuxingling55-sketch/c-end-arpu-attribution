@@ -71,12 +71,12 @@ python3 scripts/run_arpu_attribution.py \
 
 如果未传 `--compare-month`，脚本默认使用分析月上月。
 
-脚本复用 `c-query-cli-lite` 的数据库连接与执行方式：
+本项目是独立项目。脚本内置数据库连接执行器：
 
-- 默认读取同级目录 `../c-query-cli-lite/config.json`
-- 默认导入 `../c-query-cli-lite/src/executor.py` 中的 `SQLExecutor`
-- 继承 `c-query-cli-lite` 的 StarRocks 优先、失败后切 SparkSQL 逻辑
-- 如路径不同，使用 `--query-cli-root` 和 `--config` 指定
+- 默认读取本项目根目录的 `config.json`
+- 使用本项目自己的 StarRocks / SparkSQL 配置字段
+- StarRocks 优先，失败后切 SparkSQL
+- 如配置路径不同，使用 `--config` 指定
 
 示例：
 
@@ -84,11 +84,10 @@ python3 scripts/run_arpu_attribution.py \
 python3 scripts/run_arpu_attribution.py \
   --analysis-month 202604 \
   --compare-month 202603 \
-  --query-cli-root /path/to/c-query-cli-lite \
-  --config /path/to/c-query-cli-lite/config.json
+  --config /path/to/config.json
 ```
 
-不要在本项目内新增数据库账号密码配置；数据库连接统一维护在 `c-query-cli-lite/config.json`。
+不要把真实数据库账号密码提交到 Git；本项目只提交 `config.example.json`。
 
 脚本输出：
 

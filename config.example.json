@@ -1,0 +1,17 @@
+{
+  "starrocks": {
+    "host": "101.126.26.162",
+    "port": 9030,
+    "user": "<找数仓申请的账号>",
+    "password": "<密码>",
+    "database": "hive.aws"
+  },
+  "sparksql": {
+    "host": "101.126.34.246",
+    "port": 10010,
+    "user": "<选填，备用引擎账号>",
+    "password": "<选填>",
+    "database": "tmp"
+  },
+  "engine_timeout_seconds": 900
+}

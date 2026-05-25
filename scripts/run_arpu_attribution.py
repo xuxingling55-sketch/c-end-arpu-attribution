@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Run C-end ARPU attribution queries via c-query-cli-lite's SQLExecutor."""
+"""Run C-end ARPU attribution queries and export CSV results."""
 
 from __future__ import annotations
 
 import argparse
 import calendar
 import csv
-import importlib.util
 import json
-import os
+import time
 from pathlib import Path
-from time import monotonic
 from typing import Any
+
+import pandas as pd
+
+
+DEFAULT_TIMEOUT = 900
 
 
 def month_bounds(month_id: int) -> tuple[int, int]:
@@ -29,37 +32,79 @@ def previous_month(month_id: int) -> int:
     return year * 100 + month - 1
 
 
-def resolve_query_cli_root(value: str | None) -> Path:
-    if value:
-        root = Path(value).expanduser().resolve()
-    elif os.getenv("C_QUERY_CLI_LITE_ROOT"):
-        root = Path(os.environ["C_QUERY_CLI_LITE_ROOT"]).expanduser().resolve()
-    else:
-        root = Path(__file__).resolve().parents[2].parent / "c-query-cli-lite"
-
-    if not (root / "src" / "executor.py").is_file():
-        raise SystemExit(f"找不到 c-query-cli-lite 执行器: {root / 'src' / 'executor.py'}")
-    return root
-
-
-def load_query_cli_executor(query_cli_root: Path):
-    executor_path = query_cli_root / "src" / "executor.py"
-    spec = importlib.util.spec_from_file_location("c_query_cli_lite_executor", executor_path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"无法加载执行器: {executor_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.SQLExecutor
-
-
-def load_query_cli_config(query_cli_root: Path, config_path: str | None) -> dict[str, Any]:
-    path = Path(config_path).expanduser().resolve() if config_path else query_cli_root / "config.json"
+def load_config(config_path: str | None) -> dict[str, Any]:
+    path = Path(config_path).expanduser().resolve() if config_path else Path("config.json").resolve()
     if not path.is_file():
         raise SystemExit(
             f"配置文件不存在: {path}\n"
-            "请先按 c-query-cli-lite 的方式复制 config.example.json 为 config.json，并填入数据库账号密码。"
+            "请复制 config.example.json 为 config.json，并填入 StarRocks / SparkSQL 账号密码。"
         )
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+class SQLExecutor:
+    """StarRocks first, then SparkSQL fallback.
+
+    The executor is self-contained in this project.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self.sr_config = config.get("starrocks", {})
+        self.spark_config = config.get("sparksql", {})
+        self.timeout = int(config.get("engine_timeout_seconds", DEFAULT_TIMEOUT))
+
+    def execute(self, sql: str) -> tuple[pd.DataFrame, str, float]:
+        start = time.time()
+        try:
+            df = self._execute_starrocks(sql)
+            return df, "StarRocks", time.time() - start
+        except Exception as exc:
+            print(f"[引擎切换] StarRocks 执行失败（{exc}），尝试 SparkSQL...")
+            start = time.time()
+            df = self._execute_sparksql("-- Engine: Spark\n" + sql)
+            return df, "SparkSQL", time.time() - start
+
+    def _execute_starrocks(self, sql: str) -> pd.DataFrame:
+        import pymysql
+
+        cfg = self.sr_config
+        conn = pymysql.connect(
+            host=cfg["host"],
+            port=cfg.get("port", 9030),
+            user=cfg["user"],
+            password=cfg["password"],
+            database=cfg.get("database", "hive.aws"),
+            charset="utf8mb4",
+            read_timeout=self.timeout,
+            connect_timeout=30,
+        )
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    def _execute_sparksql(self, sql: str) -> pd.DataFrame:
+        from impala.dbapi import connect as impala_connect
+
+        cfg = self.spark_config
+        conn = impala_connect(
+            host=cfg["host"],
+            port=cfg.get("port", 10010),
+            auth_mechanism="PLAIN",
+            user=cfg.get("user", ""),
+            password=cfg.get("password", ""),
+            database=cfg.get("database", "tmp"),
+        )
+        try:
+            cur = conn.cursor(dictify=True)
+            cur.execute(sql)
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def sql_base(start_day: int, end_day: int) -> str:
@@ -259,16 +304,15 @@ def build_queries(analysis_month: int, compare_month: int) -> dict[str, str]:
     }
 
 
-def run_query(executor: Any, sql: str, engine: str) -> tuple[Any, str, float]:
-    start = monotonic()
+def run_query(executor: SQLExecutor, sql: str, engine: str) -> tuple[pd.DataFrame, str, float]:
+    start = time.time()
     if engine == "spark":
         df = executor._execute_sparksql("-- Engine: Spark\n" + sql)
-        return df, "SparkSQL", monotonic() - start
+        return df, "SparkSQL", time.time() - start
     if engine == "starrocks":
         df = executor._execute_starrocks(sql)
-        return df, "StarRocks", monotonic() - start
-    df, actual_engine, elapsed = executor.execute(sql)
-    return df, actual_engine, elapsed
+        return df, "StarRocks", time.time() - start
+    return executor.execute(sql)
 
 
 def write_query_sql(path: Path, sql: str) -> None:
@@ -285,8 +329,7 @@ def main() -> None:
     parser.add_argument("--analysis-month", required=True, type=int, help="分析月份，例如 202604")
     parser.add_argument("--compare-month", type=int, help="对比月份，例如 202603；不传则默认分析月上月")
     parser.add_argument("--output-dir", type=Path, default=None, help="CSV 输出目录")
-    parser.add_argument("--query-cli-root", default=None, help="c-query-cli-lite 项目路径；默认使用同级目录")
-    parser.add_argument("--config", default=None, help="c-query-cli-lite config.json 路径；默认读取项目根目录 config.json")
+    parser.add_argument("--config", default=None, help="config.json 路径，默认读取当前目录 config.json")
     parser.add_argument("--engine", choices=["auto", "starrocks", "spark"], default="auto", help="执行引擎")
     args = parser.parse_args()
 
@@ -295,14 +338,10 @@ def main() -> None:
     output_dir = args.output_dir or Path(f"outputs/c_end_arpu_{analysis_month}_vs_{compare_month}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    query_cli_root = resolve_query_cli_root(args.query_cli_root)
-    SQLExecutor = load_query_cli_executor(query_cli_root)
-    config = load_query_cli_config(query_cli_root, args.config)
-    executor = SQLExecutor(config)
+    executor = SQLExecutor(load_config(args.config))
 
     metadata: list[dict[str, Any]] = []
     for name, sql in build_queries(analysis_month, compare_month).items():
-        start = monotonic()
         df, actual_engine, elapsed = run_query(executor, sql, args.engine)
         csv_path = output_dir / f"{name}.csv"
         sql_path = output_dir / f"{name}.sql"
@@ -315,7 +354,6 @@ def main() -> None:
                 "engine": actual_engine,
                 "rows": row_count,
                 "elapsed_seconds": round(elapsed, 2),
-                "wall_seconds": round(monotonic() - start, 2),
                 "csv": str(csv_path),
                 "sql": str(sql_path),
             }
