@@ -22,22 +22,21 @@
 
 ## 快速使用
 
-安装依赖：
+先确保 `c-query-cli-lite` 可以正常取数：
 
 ```bash
-pip install -r requirements.txt
+cd /Users/hilda/Documents/GitHub/c-query-cli-lite
+python3 -m pip install -r requirements.txt
+cp config.example.json config.json
 ```
 
-设置数据库与 SSH 连接环境变量：
+打开 `c-query-cli-lite/config.json`，按该项目要求填入 StarRocks / SparkSQL 账号密码。
+
+再回到本项目安装轻量依赖：
 
 ```bash
-export HIGH_VALUE_SSH_HOST=...
-export HIGH_VALUE_SSH_USER=...
-export HIGH_VALUE_SSH_PASS=...
-export HIGH_VALUE_DB_HOST=...
-export HIGH_VALUE_DB_PORT=...
-export HIGH_VALUE_DB_USER=...
-export HIGH_VALUE_DB_PASS=...
+cd /Users/hilda/Documents/GitHub/c-end-arpu-attribution
+python3 -m pip install -r requirements.txt
 ```
 
 运行 2026 年 4 月对比 3 月的归因取数：
@@ -49,6 +48,18 @@ python3 scripts/run_arpu_attribution.py \
   --output-dir outputs/c_end_arpu_202604_vs_202603
 ```
 
+脚本默认读取同级目录下的 `../c-query-cli-lite/config.json`，并复用 `c-query-cli-lite/src/executor.py` 的 StarRocks 优先、失败后切 SparkSQL 的执行方式。
+
+如果 `c-query-cli-lite` 不在默认路径，可显式指定：
+
+```bash
+python3 scripts/run_arpu_attribution.py \
+  --analysis-month 202604 \
+  --compare-month 202603 \
+  --query-cli-root /path/to/c-query-cli-lite \
+  --config /path/to/c-query-cli-lite/config.json
+```
+
 脚本会输出：
 
 - `core_monthly.csv`：整体月指标
@@ -57,6 +68,8 @@ python3 scripts/run_arpu_attribution.py \
 - `product_l3.csv`：商品类目归因
 - `good_name.csv`：单品下钻
 - `strategy_goods.csv`：上新 / 切品承接校正
+- `metadata.json`：每个查询的执行引擎、耗时和行数
+- `*.sql`：每个归因结果对应的实际 SQL
 
 ## 口径说明
 

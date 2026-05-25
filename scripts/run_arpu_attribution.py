@@ -1,35 +1,17 @@
 #!/usr/bin/env python3
-"""Run C-end ARPU attribution queries and export CSV results."""
+"""Run C-end ARPU attribution queries via c-query-cli-lite's SQLExecutor."""
 
 from __future__ import annotations
 
 import argparse
 import calendar
 import csv
+import importlib.util
+import json
 import os
 from pathlib import Path
-from textwrap import dedent
 from time import monotonic
-
-import paramiko
-
-
-REQUIRED_ENV = [
-    "HIGH_VALUE_SSH_HOST",
-    "HIGH_VALUE_SSH_USER",
-    "HIGH_VALUE_SSH_PASS",
-    "HIGH_VALUE_DB_HOST",
-    "HIGH_VALUE_DB_PORT",
-    "HIGH_VALUE_DB_USER",
-    "HIGH_VALUE_DB_PASS",
-]
-
-
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise SystemExit(f"Missing required environment variable: {name}")
-    return value
+from typing import Any
 
 
 def month_bounds(month_id: int) -> tuple[int, int]:
@@ -45,6 +27,39 @@ def previous_month(month_id: int) -> int:
     if month == 1:
         return (year - 1) * 100 + 12
     return year * 100 + month - 1
+
+
+def resolve_query_cli_root(value: str | None) -> Path:
+    if value:
+        root = Path(value).expanduser().resolve()
+    elif os.getenv("C_QUERY_CLI_LITE_ROOT"):
+        root = Path(os.environ["C_QUERY_CLI_LITE_ROOT"]).expanduser().resolve()
+    else:
+        root = Path(__file__).resolve().parents[2].parent / "c-query-cli-lite"
+
+    if not (root / "src" / "executor.py").is_file():
+        raise SystemExit(f"找不到 c-query-cli-lite 执行器: {root / 'src' / 'executor.py'}")
+    return root
+
+
+def load_query_cli_executor(query_cli_root: Path):
+    executor_path = query_cli_root / "src" / "executor.py"
+    spec = importlib.util.spec_from_file_location("c_query_cli_lite_executor", executor_path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"无法加载执行器: {executor_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.SQLExecutor
+
+
+def load_query_cli_config(query_cli_root: Path, config_path: str | None) -> dict[str, Any]:
+    path = Path(config_path).expanduser().resolve() if config_path else query_cli_root / "config.json"
+    if not path.is_file():
+        raise SystemExit(
+            f"配置文件不存在: {path}\n"
+            "请先按 c-query-cli-lite 的方式复制 config.example.json 为 config.json，并填入数据库账号密码。"
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def sql_base(start_day: int, end_day: int) -> str:
@@ -226,36 +241,11 @@ order by revenue_delta asc
 def build_queries(analysis_month: int, compare_month: int) -> dict[str, str]:
     compare_start, _ = month_bounds(compare_month)
     _, analysis_end = month_bounds(analysis_month)
-
     return {
         "core_monthly": core_sql(compare_start, analysis_end),
-        "user_status": dimension_sql(
-            compare_start,
-            analysis_end,
-            compare_month,
-            analysis_month,
-            "user_status",
-            min_revenue=10000,
-            limit=40,
-        ),
-        "gmv_channel": dimension_sql(
-            compare_start,
-            analysis_end,
-            compare_month,
-            analysis_month,
-            "gmv_channel",
-            min_revenue=10000,
-            limit=20,
-        ),
-        "product_l3": dimension_sql(
-            compare_start,
-            analysis_end,
-            compare_month,
-            analysis_month,
-            "product_l3",
-            min_revenue=10000,
-            limit=80,
-        ),
+        "user_status": dimension_sql(compare_start, analysis_end, compare_month, analysis_month, "user_status", limit=40),
+        "gmv_channel": dimension_sql(compare_start, analysis_end, compare_month, analysis_month, "gmv_channel", limit=20),
+        "product_l3": dimension_sql(compare_start, analysis_end, compare_month, analysis_month, "product_l3", limit=80),
         "good_name": dimension_sql(
             compare_start,
             analysis_end,
@@ -269,52 +259,25 @@ def build_queries(analysis_month: int, compare_month: int) -> dict[str, str]:
     }
 
 
-def remote_script(sql: str, db: dict[str, str]) -> str:
-    return dedent(
-        f"""
-        import csv
-        import sys
-        import warnings
-        from impala.dbapi import connect
-
-        warnings.filterwarnings("ignore")
-        conn = connect(
-            host={db["host"]!r},
-            port={int(db["port"])},
-            user={db["user"]!r},
-            password={db["password"]!r},
-            auth_mechanism="PLAIN",
-        )
-        cur = conn.cursor()
-        cur.execute({sql!r})
-        writer = csv.writer(sys.stdout)
-        writer.writerow([d[0] for d in cur.description])
-        writer.writerows(cur.fetchall())
-        cur.close()
-        conn.close()
-        """
-    )
+def run_query(executor: Any, sql: str, engine: str) -> tuple[Any, str, float]:
+    start = monotonic()
+    if engine == "spark":
+        df = executor._execute_sparksql("-- Engine: Spark\n" + sql)
+        return df, "SparkSQL", monotonic() - start
+    if engine == "starrocks":
+        df = executor._execute_starrocks(sql)
+        return df, "StarRocks", monotonic() - start
+    df, actual_engine, elapsed = executor.execute(sql)
+    return df, actual_engine, elapsed
 
 
-def run_query(ssh: paramiko.SSHClient, sql: str, db: dict[str, str], remote_name: str) -> str:
-    script = remote_script(sql, db)
-    remote_path = f"/tmp/{remote_name}.py"
-    with ssh.open_sftp() as sftp:
-        with sftp.file(remote_path, "w") as remote_file:
-            remote_file.write(script)
-
-    _, stdout, stderr = ssh.exec_command(f"python3 {remote_path}", timeout=900)
-    exit_code = stdout.channel.recv_exit_status()
-    output = stdout.read().decode("utf-8", errors="replace")
-    error = stderr.read().decode("utf-8", errors="replace")
-    if exit_code != 0:
-        raise RuntimeError(f"{remote_name} failed with exit={exit_code}: {error[-3000:]}")
-    return output
+def write_query_sql(path: Path, sql: str) -> None:
+    path.write_text(sql.strip() + "\n", encoding="utf-8")
 
 
-def validate_csv(text: str) -> int:
-    rows = list(csv.reader(text.splitlines()))
-    return max(len(rows) - 1, 0)
+def validate_csv(path: Path) -> int:
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        return max(sum(1 for _ in csv.reader(csv_file)) - 1, 0)
 
 
 def main() -> None:
@@ -322,51 +285,44 @@ def main() -> None:
     parser.add_argument("--analysis-month", required=True, type=int, help="分析月份，例如 202604")
     parser.add_argument("--compare-month", type=int, help="对比月份，例如 202603；不传则默认分析月上月")
     parser.add_argument("--output-dir", type=Path, default=None, help="CSV 输出目录")
+    parser.add_argument("--query-cli-root", default=None, help="c-query-cli-lite 项目路径；默认使用同级目录")
+    parser.add_argument("--config", default=None, help="c-query-cli-lite config.json 路径；默认读取项目根目录 config.json")
+    parser.add_argument("--engine", choices=["auto", "starrocks", "spark"], default="auto", help="执行引擎")
     args = parser.parse_args()
-
-    missing = [name for name in REQUIRED_ENV if not os.getenv(name)]
-    if missing:
-        raise SystemExit("Missing required environment variables: " + ", ".join(missing))
 
     analysis_month = args.analysis_month
     compare_month = args.compare_month or previous_month(analysis_month)
     output_dir = args.output_dir or Path(f"outputs/c_end_arpu_{analysis_month}_vs_{compare_month}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ssh_conf = {
-        "host": require_env("HIGH_VALUE_SSH_HOST"),
-        "user": require_env("HIGH_VALUE_SSH_USER"),
-        "password": require_env("HIGH_VALUE_SSH_PASS"),
-    }
-    db_conf = {
-        "host": require_env("HIGH_VALUE_DB_HOST"),
-        "port": require_env("HIGH_VALUE_DB_PORT"),
-        "user": require_env("HIGH_VALUE_DB_USER"),
-        "password": require_env("HIGH_VALUE_DB_PASS"),
-    }
+    query_cli_root = resolve_query_cli_root(args.query_cli_root)
+    SQLExecutor = load_query_cli_executor(query_cli_root)
+    config = load_query_cli_config(query_cli_root, args.config)
+    executor = SQLExecutor(config)
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(
-        ssh_conf["host"],
-        username=ssh_conf["user"],
-        password=ssh_conf["password"],
-        timeout=30,
-        banner_timeout=30,
-        auth_timeout=30,
-    )
-    try:
-        for name, sql in build_queries(analysis_month, compare_month).items():
-            start = monotonic()
-            result = run_query(ssh, sql, db_conf, f"c_end_arpu_{analysis_month}_{name}")
-            row_count = validate_csv(result)
-            path = output_dir / f"{name}.csv"
-            path.write_text(result, encoding="utf-8")
-            elapsed = monotonic() - start
-            print(f"{name}: {row_count} rows -> {path} ({elapsed:.1f}s)")
-    finally:
-        ssh.close()
+    metadata: list[dict[str, Any]] = []
+    for name, sql in build_queries(analysis_month, compare_month).items():
+        start = monotonic()
+        df, actual_engine, elapsed = run_query(executor, sql, args.engine)
+        csv_path = output_dir / f"{name}.csv"
+        sql_path = output_dir / f"{name}.sql"
+        df.to_csv(csv_path, index=False, encoding="utf-8")
+        write_query_sql(sql_path, sql)
+        row_count = validate_csv(csv_path)
+        metadata.append(
+            {
+                "name": name,
+                "engine": actual_engine,
+                "rows": row_count,
+                "elapsed_seconds": round(elapsed, 2),
+                "wall_seconds": round(monotonic() - start, 2),
+                "csv": str(csv_path),
+                "sql": str(sql_path),
+            }
+        )
+        print(f"{name}: {row_count} rows via {actual_engine} -> {csv_path} ({elapsed:.1f}s)")
 
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Done. Output directory: {output_dir}")
 
 

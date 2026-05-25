@@ -71,15 +71,24 @@ python3 scripts/run_arpu_attribution.py \
 
 如果未传 `--compare-month`，脚本默认使用分析月上月。
 
-脚本依赖以下环境变量：
+脚本复用 `c-query-cli-lite` 的数据库连接与执行方式：
 
-- `HIGH_VALUE_SSH_HOST`
-- `HIGH_VALUE_SSH_USER`
-- `HIGH_VALUE_SSH_PASS`
-- `HIGH_VALUE_DB_HOST`
-- `HIGH_VALUE_DB_PORT`
-- `HIGH_VALUE_DB_USER`
-- `HIGH_VALUE_DB_PASS`
+- 默认读取同级目录 `../c-query-cli-lite/config.json`
+- 默认导入 `../c-query-cli-lite/src/executor.py` 中的 `SQLExecutor`
+- 继承 `c-query-cli-lite` 的 StarRocks 优先、失败后切 SparkSQL 逻辑
+- 如路径不同，使用 `--query-cli-root` 和 `--config` 指定
+
+示例：
+
+```bash
+python3 scripts/run_arpu_attribution.py \
+  --analysis-month 202604 \
+  --compare-month 202603 \
+  --query-cli-root /path/to/c-query-cli-lite \
+  --config /path/to/c-query-cli-lite/config.json
+```
+
+不要在本项目内新增数据库账号密码配置；数据库连接统一维护在 `c-query-cli-lite/config.json`。
 
 脚本输出：
 
@@ -91,6 +100,8 @@ python3 scripts/run_arpu_attribution.py \
 | `product_l3.csv` | 商品二级/三级类目归因 |
 | `good_name.csv` | 单品下钻 |
 | `strategy_goods.csv` | 规划提分课/全面进阶课等新老商品承接校正 |
+| `metadata.json` | 每个查询的执行引擎、耗时和行数 |
+| `*.sql` | 每个结果文件对应的实际 SQL |
 
 写作前必须读取并引用这些 CSV 中的关键结果。若脚本失败，先报告失败原因；不要凭历史结果或记忆写归因。
 
